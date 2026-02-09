@@ -1,6 +1,27 @@
 {-# LANGUAGE OverloadedStrings #-}
 module DBusMenu
-  ( buildMenu
+  ( -- * High-level menu construction
+    buildMenu
+  , populateGtkMenu
+  , buildGtkMenuItem
+
+    -- * DBusMenu protocol operations
+  , getLayout
+  , aboutToShow
+  , sendClicked
+
+    -- * Layout tree
+  , LayoutNode(..)
+  , variantToLayout
+  , tupleToLayout
+
+    -- * Layout node property accessors
+  , menuItemType
+  , menuItemLabel
+  , menuItemVisible
+  , menuItemEnabled
+  , menuItemToggleType
+  , menuItemToggleState
   ) where
 
 import Control.Concurrent (forkIO)
@@ -28,6 +49,7 @@ addCssClass :: Gtk.Widget -> T.Text -> IO ()
 addCssClass widget cssClass =
   Gtk.widgetGetStyleContext widget >>= (`Gtk.styleContextAddClass` cssClass)
 
+-- | A node in the DBusMenu layout tree.
 data LayoutNode = LayoutNode
   { lnId :: Int32
   , lnProps :: Map String Variant
@@ -36,12 +58,14 @@ data LayoutNode = LayoutNode
 
 type LayoutTuple = (Int32, Map String Variant, [Variant])
 
+-- | Parse a DBus Variant into a LayoutNode.
 variantToLayout :: Variant -> Maybe LayoutNode
 variantToLayout v = do
   (i, props, kids) <- fromVariant v :: Maybe LayoutTuple
   children <- traverse variantToLayout kids
   pure LayoutNode { lnId = i, lnProps = props, lnChildren = children }
 
+-- | Convert a raw layout tuple into a LayoutNode.
 tupleToLayout :: LayoutTuple -> LayoutNode
 tupleToLayout (i, props, kids) =
   LayoutNode
@@ -55,16 +79,21 @@ unwrapCall :: String -> Either MethodError a -> IO a
 unwrapCall label (Left err) = fail $ label <> " failed: " <> show err
 unwrapCall _ (Right a) = pure a
 
+-- | Notify the DBusMenu service that a menu item is about to be shown.
+-- Returns True if the service indicates an update is needed.
 aboutToShow :: Client -> BusName -> ObjectPath -> Int32 -> IO Bool
 aboutToShow client dest path i =
   either (const False) id <$> DM.aboutToShow client dest path i
 
+-- | Fetch the layout tree from the DBusMenu service.
 getLayout :: Client -> BusName -> ObjectPath -> Int32 -> Int32 -> [String] -> IO (Word32, LayoutNode)
 getLayout client dest path parentId depth propNames = do
   (rev, tup) <- unwrapCall "GetLayout" =<<
     DM.getLayout client dest path parentId depth propNames
   pure (rev, tupleToLayout tup)
 
+-- | Send a \"clicked\" event to the DBusMenu service for the given item.
+-- Runs asynchronously on a forked thread.
 sendClicked :: Client -> BusName -> ObjectPath -> Int32 -> Word32 -> IO ()
 sendClicked client dest path itemId ts = do
   dbusMenuLogger DEBUG $
@@ -103,31 +132,39 @@ getPropI32 :: String -> LayoutNode -> Maybe Int32
 getPropI32 key LayoutNode { lnProps = props } =
   Map.lookup key props >>= fromVariant
 
+-- | The item type (e.g. @\"separator\"@), or Nothing for standard items.
 menuItemType :: LayoutNode -> Maybe String
 menuItemType = getPropS "type"
 
+-- | The display label, defaulting to @\"\"@ if absent.
 menuItemLabel :: LayoutNode -> String
 menuItemLabel n =
-  -- libdbusmenu uses "label" with underscores for mnemonics; GTK3 MenuItem
-  -- has use-underline support, but defaulting to literal label is fine.
   fromMaybe "" (getPropS "label" n)
 
+-- | Whether the item is visible, defaulting to True.
 menuItemVisible :: LayoutNode -> Bool
 menuItemVisible n = fromMaybe True (getPropB "visible" n)
 
+-- | Whether the item is enabled\/sensitive, defaulting to True.
 menuItemEnabled :: LayoutNode -> Bool
 menuItemEnabled n = fromMaybe True (getPropB "enabled" n)
 
+-- | The toggle type (e.g. @\"checkmark\"@, @\"radio\"@), if any.
 menuItemToggleType :: LayoutNode -> Maybe String
 menuItemToggleType = getPropS "toggle-type"
 
+-- | The toggle state: 0 = off, 1 = on, -1 = indeterminate.
 menuItemToggleState :: LayoutNode -> Maybe Int32
 menuItemToggleState = getPropI32 "toggle-state"
 
+-- | Populate a GTK Menu widget with items from a layout tree.
+-- Clears any existing children first.
+--
+-- CSS classes applied to the menu: @dbusmenu-menu@
 populateGtkMenu :: Client -> BusName -> ObjectPath -> Gtk.Menu -> LayoutNode -> IO ()
 populateGtkMenu client dest path gtkMenu root = do
   gtkMenuW <- Gtk.toWidget gtkMenu
-  addCssClass gtkMenuW "tray-menu"
+  addCssClass gtkMenuW "dbusmenu-menu"
 
   -- Clear existing children (for refreshes, e.g. submenus).
   children <- Gtk.containerGetChildren gtkMenu
@@ -137,8 +174,25 @@ populateGtkMenu client dest path gtkMenu root = do
     widget <- buildGtkMenuItem client dest path child
     Gtk.menuShellAppend gtkMenu widget
 
+-- | Build a single GTK MenuItem from a layout node.
+--
+-- CSS classes applied:
+--
+-- * @dbusmenu-item@ on every item
+-- * @dbusmenu-separator@ on separator items
+-- * @dbusmenu-toggle@ on checkmark and radio items
+-- * @dbusmenu-checkmark@ on checkmark items
+-- * @dbusmenu-radio@ on radio items
+-- * @dbusmenu-checked@ on active\/checked toggle items
+-- * @dbusmenu-has-submenu@ on items with children
+--
+-- Submenus get:
+--
+-- * @dbusmenu-menu@ (base menu class)
+-- * @dbusmenu-submenu@
 buildGtkMenuItem :: Client -> BusName -> ObjectPath -> LayoutNode -> IO Gtk.MenuItem
 buildGtkMenuItem client dest path node = do
+  let isChecked = menuItemToggleState node == Just 1
   item <- case menuItemType node of
     Just "separator" -> do
       sep <- Gtk.separatorMenuItemNew
@@ -148,26 +202,32 @@ buildGtkMenuItem client dest path node = do
       case menuItemToggleType node of
         Just "checkmark" -> do
           c <- Gtk.checkMenuItemNewWithMnemonic label
-          Gtk.checkMenuItemSetActive c (menuItemToggleState node == Just 1)
+          Gtk.checkMenuItemSetActive c isChecked
           unsafeCastTo Gtk.MenuItem c
         Just "radio" -> do
           c <- Gtk.checkMenuItemNewWithMnemonic label
           Gtk.checkMenuItemSetDrawAsRadio c True
-          Gtk.checkMenuItemSetActive c (menuItemToggleState node == Just 1)
+          Gtk.checkMenuItemSetActive c isChecked
           unsafeCastTo Gtk.MenuItem c
         _ -> Gtk.menuItemNewWithMnemonic label
 
-  Gtk.widgetSetName item (T.pack ("tray-menu-item-" <> show (lnId node)))
+  Gtk.widgetSetName item (T.pack ("dbusmenu-item-" <> show (lnId node)))
   itemW <- Gtk.toWidget item
-  addCssClass itemW "tray-menu-item"
+  addCssClass itemW "dbusmenu-item"
 
   case menuItemType node of
-    Just "separator" -> addCssClass itemW "tray-menu-separator"
+    Just "separator" -> addCssClass itemW "dbusmenu-separator"
     _ -> pure ()
 
   case menuItemToggleType node of
-    Just "checkmark" -> addCssClass itemW "tray-menu-check"
-    Just "radio" -> addCssClass itemW "tray-menu-radio"
+    Just "checkmark" -> do
+      addCssClass itemW "dbusmenu-toggle"
+      addCssClass itemW "dbusmenu-checkmark"
+      when isChecked $ addCssClass itemW "dbusmenu-checked"
+    Just "radio" -> do
+      addCssClass itemW "dbusmenu-toggle"
+      addCssClass itemW "dbusmenu-radio"
+      when isChecked $ addCssClass itemW "dbusmenu-checked"
     _ -> pure ()
 
   Gtk.widgetSetSensitive item (menuItemEnabled node)
@@ -184,11 +244,11 @@ buildGtkMenuItem client dest path node = do
                         (lnId node) (show e))
       pure ()
     else do
-      addCssClass itemW "tray-menu-item-has-submenu"
+      addCssClass itemW "dbusmenu-has-submenu"
       submenu <- Gtk.menuNew
-      Gtk.widgetSetName submenu (T.pack ("tray-menu-submenu-" <> show (lnId node)))
+      Gtk.widgetSetName submenu (T.pack ("dbusmenu-submenu-" <> show (lnId node)))
       submenuW <- Gtk.toWidget submenu
-      addCssClass submenuW "tray-menu-submenu"
+      addCssClass submenuW "dbusmenu-submenu"
       -- Populate with the eagerly-fetched layout so submenus are usable even if
       -- the service doesn't support/require lazy updates.
       populateGtkMenu client dest path submenu node
@@ -207,6 +267,9 @@ buildGtkMenuItem client dest path node = do
 
   pure item
 
+-- | Build a complete GTK Menu from a DBusMenu service.
+--
+-- CSS classes applied to the root menu: @dbusmenu-menu@, @dbusmenu-root@
 buildMenu :: Client -> BusName -> ObjectPath -> IO Gtk.Menu
 buildMenu client dest path = do
   dbusMenuLogger DEBUG $
@@ -216,8 +279,8 @@ buildMenu client dest path = do
   dbusMenuLogger DEBUG $
     printf "buildMenu: root has %d children" (length (lnChildren layout))
   menu <- Gtk.menuNew
-  Gtk.widgetSetName menu "tray-menu-root"
+  Gtk.widgetSetName menu "dbusmenu-root"
   menuW <- Gtk.toWidget menu
-  addCssClass menuW "tray-menu-root"
+  addCssClass menuW "dbusmenu-root"
   populateGtkMenu client dest path menu layout
   pure menu
