@@ -1,5 +1,13 @@
 # Changelog for dbus-menu
 
+## 0.1.3.0
+
+* Menu-level click dispatch: leaf item actions are registered in a persistent
+  dispatch table (shared `IORef` map) owned by the menu, not captured in
+  per-widget closures. Individual `onMenuItemActivate` handlers are thin
+  trampolines that look up the action at activation time, decoupling dispatch
+  from widget lifecycles.
+
 ## 0.1.2.0
 
 * Fix submenu clicks being silently dropped: run `AboutToShow` and `GetLayout`

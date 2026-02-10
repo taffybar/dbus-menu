@@ -29,7 +29,7 @@ import Control.Concurrent (forkIO)
 import Control.Exception.Enclosed (catchAny)
 import Control.Monad (forM_, void, when)
 import Data.Int (Int32)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
@@ -71,6 +71,12 @@ data LayoutNode = LayoutNode
   } deriving (Eq, Show)
 
 type LayoutTuple = (Int32, Map String Variant, [Variant])
+
+-- | Menu-level click dispatch table.  Maps DBusMenu item IDs to their click
+-- actions.  The table is owned by the persistent 'Gtk.Menu' widget and
+-- survives item rebuilds, decoupling action dispatch from individual widget
+-- lifecycles.
+type ClickDispatch = IORef (Map Int32 (IO ()))
 
 -- | Parse a DBus Variant into a LayoutNode.
 variantToLayout :: Variant -> Maybe LayoutNode
@@ -186,6 +192,12 @@ menuItemToggleState = getPropI32 "toggle-state"
 -- CSS classes applied to the menu: @dbusmenu-menu@
 populateGtkMenu :: Client -> BusName -> ObjectPath -> Gtk.Menu -> LayoutNode -> IO ()
 populateGtkMenu client dest path gtkMenu root = do
+  dispatch <- newIORef Map.empty
+  populateGtkMenu' client dest path dispatch gtkMenu root
+
+-- | Internal: populate with a shared dispatch table.
+populateGtkMenu' :: Client -> BusName -> ObjectPath -> ClickDispatch -> Gtk.Menu -> LayoutNode -> IO ()
+populateGtkMenu' client dest path dispatch gtkMenu root = do
   gtkMenuW <- Gtk.toWidget gtkMenu
   addCssClass gtkMenuW "dbusmenu-menu"
 
@@ -194,7 +206,7 @@ populateGtkMenu client dest path gtkMenu root = do
   forM_ children Gtk.widgetDestroy
 
   forM_ (lnChildren root) $ \child -> when (menuItemVisible child) $ do
-    widget <- buildGtkMenuItem client dest path gtkMenu child
+    widget <- buildGtkMenuItem' client dest path dispatch gtkMenu child
     Gtk.menuShellAppend gtkMenu widget
 
 -- | Build a single GTK MenuItem from a layout node.
@@ -214,7 +226,17 @@ populateGtkMenu client dest path gtkMenu root = do
 -- * @dbusmenu-menu@ (base menu class)
 -- * @dbusmenu-submenu@
 buildGtkMenuItem :: Client -> BusName -> ObjectPath -> Gtk.Menu -> LayoutNode -> IO Gtk.MenuItem
-buildGtkMenuItem client dest path _parentMenu node = do
+buildGtkMenuItem client dest path parentMenu node = do
+  dispatch <- newIORef Map.empty
+  buildGtkMenuItem' client dest path dispatch parentMenu node
+
+-- | Internal: build a menu item with a shared dispatch table.
+--
+-- Leaf-item click handlers are thin trampolines that look up the item's
+-- action in the dispatch table at activation time, decoupling action
+-- dispatch from individual widget lifecycles.
+buildGtkMenuItem' :: Client -> BusName -> ObjectPath -> ClickDispatch -> Gtk.Menu -> LayoutNode -> IO Gtk.MenuItem
+buildGtkMenuItem' client dest path dispatch _parentMenu node = do
   let isChecked = menuItemToggleState node == Just 1
   item <- case menuItemType node of
     Just "separator" -> do
@@ -263,13 +285,20 @@ buildGtkMenuItem client dest path _parentMenu node = do
   -- behave as submenus (signaled by children-display="submenu").
   if not (menuItemHasSubmenu node)
     then do
-      _ <- Gtk.onMenuItemActivate item $
-        catchAny
-          (do ts <- Gtk.getCurrentEventTime
-              sendClicked client dest path (lnId node) ts)
-          (\e -> dbusMenuLogger WARNING $
-                 printf "Menu item %d click failed (stale ID?): %s"
-                        (lnId node) (show e))
+      -- Register click action in the menu-level dispatch table.
+      let itemId = lnId node
+      modifyIORef' dispatch $ Map.insert itemId $
+        sendClicked client dest path itemId =<< Gtk.getCurrentEventTime
+      -- Thin trampoline: look up action from the persistent dispatch table
+      -- at activation time rather than capturing it in a per-widget closure.
+      _ <- Gtk.onMenuItemActivate item $ catchAny
+        (do actions <- readIORef dispatch
+            case Map.lookup itemId actions of
+              Just action -> action
+              Nothing -> dbusMenuLogger WARNING $
+                printf "Dispatch: no action for item %d" itemId)
+        (\e -> dbusMenuLogger WARNING $
+               printf "Menu item %d dispatch failed: %s" itemId (show e))
       pure ()
     else do
       addCssClass itemW "dbusmenu-has-submenu"
@@ -279,7 +308,7 @@ buildGtkMenuItem client dest path _parentMenu node = do
       addCssClass submenuW "dbusmenu-submenu"
       -- Populate with the eagerly-fetched layout so submenus are usable even if
       -- the service doesn't support/require lazy updates.
-      populateGtkMenu client dest path submenu node
+      populateGtkMenu' client dest path dispatch submenu node
       loadedRef <- newIORef (not (null (lnChildren node)))
       let refresh = void $ forkIO $ catchAny
             (do -- Run DBus calls on a forked thread to avoid blocking the GTK
@@ -293,7 +322,7 @@ buildGtkMenuItem client dest path _parentMenu node = do
                   -- PRIORITY_DEFAULT_IDLE ensures pending input events (clicks)
                   -- are processed first.
                   void $ GLib.idleAdd GLib.PRIORITY_DEFAULT_IDLE $ do
-                    populateGtkMenu client dest path submenu layout
+                    populateGtkMenu' client dest path dispatch submenu layout
                     writeIORef loadedRef True
                     Gtk.widgetShowAll submenu
                     return False)
@@ -318,9 +347,10 @@ buildMenu client dest path = do
   (_, layout) <- getLayout client dest path 0 (-1) layoutPropNames
   dbusMenuLogger DEBUG $
     printf "buildMenu: root has %d children" (length (lnChildren layout))
+  dispatch <- newIORef Map.empty
   menu <- Gtk.menuNew
   Gtk.widgetSetName menu "dbusmenu-root"
   menuW <- Gtk.toWidget menu
   addCssClass menuW "dbusmenu-root"
-  populateGtkMenu client dest path menu layout
+  populateGtkMenu' client dest path dispatch menu layout
   pure menu
