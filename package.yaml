@@ -1,5 +1,5 @@
 name:                dbus-menu
-version:             0.1.1.1
+version:             0.1.2.0
 github:              "taffybar/dbus-menu"
 license:             BSD3
 author:              "Ivan Malison"

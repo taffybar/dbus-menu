@@ -38,6 +38,7 @@ import Data.Word (Word32)
 import DBus
 import DBus.Client
 import Data.GI.Base (unsafeCastTo)
+import qualified GI.GLib as GLib
 import qualified GI.Gtk as Gtk
 import System.Log.Logger (Priority(..), logM)
 import Text.Printf
@@ -280,23 +281,28 @@ buildGtkMenuItem client dest path _parentMenu node = do
       -- the service doesn't support/require lazy updates.
       populateGtkMenu client dest path submenu node
       loadedRef <- newIORef (not (null (lnChildren node)))
-      let refresh =
-            catchAny
-              (do -- Allow the service to update the submenu content lazily.
-                  needUpdate <- aboutToShow client dest path (lnId node)
-                  loaded <- readIORef loadedRef
-                  when (needUpdate || not loaded) $ do
-                    (_, layout) <- getLayout client dest path (lnId node) 1 layoutPropNames
+      let refresh = void $ forkIO $ catchAny
+            (do -- Run DBus calls on a forked thread to avoid blocking the GTK
+                -- main loop (which would cause queued click events to be lost
+                -- when populateGtkMenu rebuilds menu items).
+                needUpdate <- aboutToShow client dest path (lnId node)
+                loaded <- readIORef loadedRef
+                when (needUpdate || not loaded) $ do
+                  (_, layout) <- getLayout client dest path (lnId node) 1 layoutPropNames
+                  -- Post GTK updates back on the main thread.  Using
+                  -- PRIORITY_DEFAULT_IDLE ensures pending input events (clicks)
+                  -- are processed first.
+                  void $ GLib.idleAdd GLib.PRIORITY_DEFAULT_IDLE $ do
                     populateGtkMenu client dest path submenu layout
                     writeIORef loadedRef True
-                  Gtk.widgetShowAll submenu)
-              (\e -> dbusMenuLogger WARNING $
-                     printf "Submenu %d refresh failed (stale ID?): %s"
-                            (lnId node) (show e))
-      _ <- Gtk.onWidgetShow submenu refresh
-      -- Gtk.Menu show semantics can vary; also refresh when the parent item is
-      -- activated (e.g. click/keyboard open).
-      _ <- Gtk.onMenuItemActivate item refresh
+                    Gtk.widgetShowAll submenu
+                    return False)
+            (\e -> dbusMenuLogger WARNING $
+                   printf "Submenu %d refresh failed (stale ID?): %s"
+                          (lnId node) (show e))
+      _ <- Gtk.onWidgetShow submenu $ do
+        refresh
+        Gtk.widgetShowAll submenu
       Gtk.menuItemSetSubmenu item (Just submenu)
 
   pure item
