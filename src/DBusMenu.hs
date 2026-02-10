@@ -213,7 +213,7 @@ populateGtkMenu client dest path gtkMenu root = do
 -- * @dbusmenu-menu@ (base menu class)
 -- * @dbusmenu-submenu@
 buildGtkMenuItem :: Client -> BusName -> ObjectPath -> Gtk.Menu -> LayoutNode -> IO Gtk.MenuItem
-buildGtkMenuItem client dest path parentMenu node = do
+buildGtkMenuItem client dest path _parentMenu node = do
   let isChecked = menuItemToggleState node == Just 1
   item <- case menuItemType node of
     Just "separator" -> do
@@ -276,12 +276,6 @@ buildGtkMenuItem client dest path parentMenu node = do
       Gtk.widgetSetName submenu (T.pack ("dbusmenu-submenu-" <> show (lnId node)))
       submenuW <- Gtk.toWidget submenu
       addCssClass submenuW "dbusmenu-submenu"
-      -- Attach the submenu to the parent menu widget so it inherits the
-      -- same CSS parent chain (via menuAttachToWidget).  Without this,
-      -- the submenu popup window is CSS-isolated and high-specificity
-      -- rules like .outer-pad.sni-tray menu menuitem * don't reach it.
-      parentMenuW <- Gtk.toWidget parentMenu
-      Gtk.menuAttachToWidget submenu parentMenuW Nothing
       -- Populate with the eagerly-fetched layout so submenus are usable even if
       -- the service doesn't support/require lazy updates.
       populateGtkMenu client dest path submenu node

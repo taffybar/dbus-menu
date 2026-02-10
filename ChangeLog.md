@@ -1,5 +1,10 @@
 # Changelog for dbus-menu
 
+## 0.1.1.1
+
+* Fix "menu already attached" GTK warning by removing redundant
+  `menuAttachToWidget` call on submenus (superseded by `menuItemSetSubmenu`)
+
 ## 0.1.1.0
 
 * Expand module exports (DBusMenu, DBusMenu.Client, DBusMenu.Client.Util)
