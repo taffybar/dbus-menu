@@ -20,6 +20,7 @@ module DBusMenu
   , menuItemLabel
   , menuItemVisible
   , menuItemEnabled
+  , menuItemChildrenDisplay
   , menuItemToggleType
   , menuItemToggleState
   ) where
@@ -28,6 +29,7 @@ import Control.Concurrent (forkIO)
 import Control.Exception.Enclosed (catchAny)
 import Control.Monad (forM_, void, when)
 import Data.Int (Int32)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
@@ -44,6 +46,17 @@ import qualified DBusMenu.Client as DM
 
 dbusMenuLogger :: Priority -> String -> IO ()
 dbusMenuLogger = logM "DBusMenu"
+
+layoutPropNames :: [String]
+layoutPropNames =
+  [ "type"
+  , "label"
+  , "visible"
+  , "enabled"
+  , "children-display"
+  , "toggle-type"
+  , "toggle-state"
+  ]
 
 addCssClass :: Gtk.Widget -> T.Text -> IO ()
 addCssClass widget cssClass =
@@ -149,6 +162,15 @@ menuItemVisible n = fromMaybe True (getPropB "visible" n)
 menuItemEnabled :: LayoutNode -> Bool
 menuItemEnabled n = fromMaybe True (getPropB "enabled" n)
 
+-- | How children should be displayed for this item (typically @\"submenu\"@),
+-- if provided by the service.
+menuItemChildrenDisplay :: LayoutNode -> Maybe String
+menuItemChildrenDisplay = getPropS "children-display"
+
+menuItemHasSubmenu :: LayoutNode -> Bool
+menuItemHasSubmenu n =
+  menuItemChildrenDisplay n == Just "submenu" || not (null (lnChildren n))
+
 -- | The toggle type (e.g. @\"checkmark\"@, @\"radio\"@), if any.
 menuItemToggleType :: LayoutNode -> Maybe String
 menuItemToggleType = getPropS "toggle-type"
@@ -171,7 +193,7 @@ populateGtkMenu client dest path gtkMenu root = do
   forM_ children Gtk.widgetDestroy
 
   forM_ (lnChildren root) $ \child -> when (menuItemVisible child) $ do
-    widget <- buildGtkMenuItem client dest path child
+    widget <- buildGtkMenuItem client dest path gtkMenu child
     Gtk.menuShellAppend gtkMenu widget
 
 -- | Build a single GTK MenuItem from a layout node.
@@ -190,8 +212,8 @@ populateGtkMenu client dest path gtkMenu root = do
 --
 -- * @dbusmenu-menu@ (base menu class)
 -- * @dbusmenu-submenu@
-buildGtkMenuItem :: Client -> BusName -> ObjectPath -> LayoutNode -> IO Gtk.MenuItem
-buildGtkMenuItem client dest path node = do
+buildGtkMenuItem :: Client -> BusName -> ObjectPath -> Gtk.Menu -> LayoutNode -> IO Gtk.MenuItem
+buildGtkMenuItem client dest path parentMenu node = do
   let isChecked = menuItemToggleState node == Just 1
   item <- case menuItemType node of
     Just "separator" -> do
@@ -233,7 +255,12 @@ buildGtkMenuItem client dest path node = do
   Gtk.widgetSetSensitive item (menuItemEnabled node)
 
   -- Submenu handling: build children now, and refresh on show via AboutToShow/GetLayout.
-  if null (lnChildren node)
+  --
+  -- Important: do not infer "leaf" solely from lnChildren. When GetLayout is
+  -- called with a limited recursionDepth (or when a service lazily populates),
+  -- submenu items can legitimately have no embedded children but still need to
+  -- behave as submenus (signaled by children-display="submenu").
+  if not (menuItemHasSubmenu node)
     then do
       _ <- Gtk.onMenuItemActivate item $
         catchAny
@@ -249,20 +276,33 @@ buildGtkMenuItem client dest path node = do
       Gtk.widgetSetName submenu (T.pack ("dbusmenu-submenu-" <> show (lnId node)))
       submenuW <- Gtk.toWidget submenu
       addCssClass submenuW "dbusmenu-submenu"
+      -- Attach the submenu to the parent menu widget so it inherits the
+      -- same CSS parent chain (via menuAttachToWidget).  Without this,
+      -- the submenu popup window is CSS-isolated and high-specificity
+      -- rules like .outer-pad.sni-tray menu menuitem * don't reach it.
+      parentMenuW <- Gtk.toWidget parentMenu
+      Gtk.menuAttachToWidget submenu parentMenuW Nothing
       -- Populate with the eagerly-fetched layout so submenus are usable even if
       -- the service doesn't support/require lazy updates.
       populateGtkMenu client dest path submenu node
+      loadedRef <- newIORef (not (null (lnChildren node)))
       let refresh =
             catchAny
               (do -- Allow the service to update the submenu content lazily.
-                  _ <- aboutToShow client dest path (lnId node)
-                  (_, layout) <- getLayout client dest path (lnId node) 1 []
-                  populateGtkMenu client dest path submenu layout
+                  needUpdate <- aboutToShow client dest path (lnId node)
+                  loaded <- readIORef loadedRef
+                  when (needUpdate || not loaded) $ do
+                    (_, layout) <- getLayout client dest path (lnId node) 1 layoutPropNames
+                    populateGtkMenu client dest path submenu layout
+                    writeIORef loadedRef True
                   Gtk.widgetShowAll submenu)
               (\e -> dbusMenuLogger WARNING $
                      printf "Submenu %d refresh failed (stale ID?): %s"
                             (lnId node) (show e))
       _ <- Gtk.onWidgetShow submenu refresh
+      -- Gtk.Menu show semantics can vary; also refresh when the parent item is
+      -- activated (e.g. click/keyboard open).
+      _ <- Gtk.onMenuItemActivate item refresh
       Gtk.menuItemSetSubmenu item (Just submenu)
 
   pure item
@@ -275,7 +315,7 @@ buildMenu client dest path = do
   dbusMenuLogger DEBUG $
     printf "buildMenu: dest=%s path=%s" (show dest) (show path)
   _ <- aboutToShow client dest path 0
-  (_, layout) <- getLayout client dest path 0 (-1) []
+  (_, layout) <- getLayout client dest path 0 (-1) layoutPropNames
   dbusMenuLogger DEBUG $
     printf "buildMenu: root has %d children" (length (lnChildren layout))
   menu <- Gtk.menuNew
