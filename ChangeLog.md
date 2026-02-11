@@ -1,5 +1,12 @@
 # Changelog for dbus-menu
 
+## 0.1.3.1
+
+* Make click dispatch truly menu-owned: store the click dispatch table on the
+  `Gtk.Menu` GObject so it survives `populateGtkMenu` refreshes and works
+  correctly for exported `populateGtkMenu`/`buildGtkMenuItem` APIs.
+* Add `gi-gobject` dependency (used to associate dispatch table with menu).
+
 ## 0.1.3.0
 
 * Menu-level click dispatch: leaf item actions are registered in a persistent

@@ -29,7 +29,7 @@ import Control.Concurrent (forkIO)
 import Control.Exception.Enclosed (catchAny)
 import Control.Monad (forM_, void, when)
 import Data.Int (Int32)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
@@ -38,7 +38,17 @@ import Data.Word (Word32)
 import DBus
 import DBus.Client
 import Data.GI.Base (unsafeCastTo)
+import Foreign.Ptr (Ptr, nullPtr)
+import Foreign.StablePtr
+  ( StablePtr
+  , castPtrToStablePtr
+  , castStablePtrToPtr
+  , deRefStablePtr
+  , freeStablePtr
+  , newStablePtr
+  )
 import qualified GI.GLib as GLib
+import qualified GI.GObject.Objects.Object as GObject
 import qualified GI.Gtk as Gtk
 import System.Log.Logger (Priority(..), logM)
 import Text.Printf
@@ -77,6 +87,48 @@ type LayoutTuple = (Int32, Map String Variant, [Variant])
 -- survives item rebuilds, decoupling action dispatch from individual widget
 -- lifecycles.
 type ClickDispatch = IORef (Map Int32 (IO ()))
+
+clickDispatchKey :: T.Text
+clickDispatchKey = "dbus-menu.click-dispatch"
+
+getMenuClickDispatch :: Gtk.Menu -> IO (Maybe ClickDispatch)
+getMenuClickDispatch menu = do
+  p <- GObject.objectGetData menu clickDispatchKey
+  if p == nullPtr
+    then pure Nothing
+    else Just <$> deRefStablePtr (castPtrToStablePtr p)
+
+setMenuClickDispatch :: Gtk.Menu -> ClickDispatch -> IO ()
+setMenuClickDispatch menu dispatch = do
+  -- Tie the dispatch table to the GObject lifetime. We store a StablePtr to the
+  -- IORef; freeing the StablePtr does not free the IORef itself (which can
+  -- still be referenced by signal handlers), but it does avoid leaking the
+  -- stable pointer.
+  sp <- newStablePtr dispatch
+  GObject.objectSetDataFull
+    menu
+    clickDispatchKey
+    (castStablePtrToPtr sp :: Ptr ())
+    (Just $ \p -> freeStablePtr (castPtrToStablePtr p :: StablePtr ClickDispatch))
+
+ensureMenuClickDispatch :: Gtk.Menu -> IO ClickDispatch
+ensureMenuClickDispatch menu = do
+  existing <- getMenuClickDispatch menu
+  case existing of
+    Just dispatch -> pure dispatch
+    Nothing -> do
+      dispatch <- newIORef Map.empty
+      setMenuClickDispatch menu dispatch
+      pure dispatch
+
+ensureMenuClickDispatchWith :: Gtk.Menu -> ClickDispatch -> IO ()
+ensureMenuClickDispatchWith menu dispatch = do
+  existing <- getMenuClickDispatch menu
+  case existing of
+    Nothing -> setMenuClickDispatch menu dispatch
+    Just existingDispatch ->
+      when (existingDispatch /= dispatch) $
+        dbusMenuLogger WARNING "Menu already has a different click dispatch; leaving existing one in place"
 
 -- | Parse a DBus Variant into a LayoutNode.
 variantToLayout :: Variant -> Maybe LayoutNode
@@ -192,7 +244,7 @@ menuItemToggleState = getPropI32 "toggle-state"
 -- CSS classes applied to the menu: @dbusmenu-menu@
 populateGtkMenu :: Client -> BusName -> ObjectPath -> Gtk.Menu -> LayoutNode -> IO ()
 populateGtkMenu client dest path gtkMenu root = do
-  dispatch <- newIORef Map.empty
+  dispatch <- ensureMenuClickDispatch gtkMenu
   populateGtkMenu' client dest path dispatch gtkMenu root
 
 -- | Internal: populate with a shared dispatch table.
@@ -227,7 +279,7 @@ populateGtkMenu' client dest path dispatch gtkMenu root = do
 -- * @dbusmenu-submenu@
 buildGtkMenuItem :: Client -> BusName -> ObjectPath -> Gtk.Menu -> LayoutNode -> IO Gtk.MenuItem
 buildGtkMenuItem client dest path parentMenu node = do
-  dispatch <- newIORef Map.empty
+  dispatch <- ensureMenuClickDispatch parentMenu
   buildGtkMenuItem' client dest path dispatch parentMenu node
 
 -- | Internal: build a menu item with a shared dispatch table.
@@ -287,8 +339,10 @@ buildGtkMenuItem' client dest path dispatch _parentMenu node = do
     then do
       -- Register click action in the menu-level dispatch table.
       let itemId = lnId node
-      modifyIORef' dispatch $ Map.insert itemId $
-        sendClicked client dest path itemId =<< Gtk.getCurrentEventTime
+      atomicModifyIORef' dispatch $ \m ->
+        ( Map.insert itemId (sendClicked client dest path itemId =<< Gtk.getCurrentEventTime) m
+        , ()
+        )
       -- Thin trampoline: look up action from the persistent dispatch table
       -- at activation time rather than capturing it in a per-widget closure.
       _ <- Gtk.onMenuItemActivate item $ catchAny
@@ -303,6 +357,7 @@ buildGtkMenuItem' client dest path dispatch _parentMenu node = do
     else do
       addCssClass itemW "dbusmenu-has-submenu"
       submenu <- Gtk.menuNew
+      ensureMenuClickDispatchWith submenu dispatch
       Gtk.widgetSetName submenu (T.pack ("dbusmenu-submenu-" <> show (lnId node)))
       submenuW <- Gtk.toWidget submenu
       addCssClass submenuW "dbusmenu-submenu"
@@ -347,8 +402,8 @@ buildMenu client dest path = do
   (_, layout) <- getLayout client dest path 0 (-1) layoutPropNames
   dbusMenuLogger DEBUG $
     printf "buildMenu: root has %d children" (length (lnChildren layout))
-  dispatch <- newIORef Map.empty
   menu <- Gtk.menuNew
+  dispatch <- ensureMenuClickDispatch menu
   Gtk.widgetSetName menu "dbusmenu-root"
   menuW <- Gtk.toWidget menu
   addCssClass menuW "dbusmenu-root"
