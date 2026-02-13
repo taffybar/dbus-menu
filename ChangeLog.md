@@ -1,5 +1,9 @@
 # Changelog for dbus-menu
 
+## 0.1.3.2
+
+* Relax `template-haskell` upper bound to `< 2.24` to support GHC 9.12.
+
 ## 0.1.3.1
 
 * Make click dispatch truly menu-owned: store the click dispatch table on the
